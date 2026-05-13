@@ -1,14 +1,14 @@
-FROM openjdk:8 AS build_image
+FROM eclipse-temurin:8-jdk AS build_image
 
 WORKDIR /usr/src/app/
 
-RUN apt update && apt install maven -y
+RUN apt-get update && apt-get install -y maven
 
 COPY ./ /usr/src/app/
 
 RUN mvn install -DskipTests
 
-FROM openjdk:8
+FROM eclipse-temurin:8-jre
 
 WORKDIR /usr/src/app/
 
