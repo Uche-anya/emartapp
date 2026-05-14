@@ -18,23 +18,29 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            set -e
+
             echo "Creating microservices directory if missing..."
             mkdir -p ~/microservices
             cd ~/microservices
 
             echo "Checking if emartapp repo exists..."
             if [ ! -d "emartapp" ]; then
-              echo "Repo not found. Cloning..."
+              echo "Repo not found. Cloning your fork..."
               git clone https://github.com/Uche-anya/emartapp.git
             fi
 
             cd ~/microservices/emartapp
 
-            echo "Pulling latest code from main..."
-            git pull origin main
+            echo "Making sure EC2 repo points to your fork..."
+            git remote set-url origin https://github.com/Uche-anya/emartapp.git
+
+            echo "Resetting EC2 repo to latest main from your fork..."
+            git fetch origin main
+            git reset --hard origin/main
 
             echo "Stopping old containers..."
-            docker compose down
+            docker compose down || true
 
             echo "Rebuilding and starting containers..."
             docker compose up -d --build
