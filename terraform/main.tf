@@ -40,11 +40,11 @@ resource "aws_security_group" "emartapp_sg" {
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description = "Allow SSH from my IP only"
+    description = "Allow SSH from anywhere for GitHub Actions"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.ssh_allowed_cidr]
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
