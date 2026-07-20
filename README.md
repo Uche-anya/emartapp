@@ -1,8 +1,10 @@
 # emartapp — deploying a forked microservices app on AWS
 
-A fork of the `emartapp` microservices project, which I used as a base to practise infrastructure automation and CI/CD rather than application development. I didn't write the app. What I added was the Terraform to provision AWS, a GitHub Actions pipeline that deploys on push, and a fair amount of learning about how quickly a badly-sized EC2 instance drains an AWS credit balance.
+A fork of the `emartapp` microservices project, which I used as a base to practise infrastructure automation and CI/CD rather than application development. I didn't write the app. What I added was the Terraform to provision AWS, a GitHub Actions pipeline that builds and deploys on push, and a fair amount of learning about how quickly a badly-sized EC2 instance drains an AWS credit balance.
 
 That last part turned out to be the most useful thing I got out of this, so it has its own section below.
+
+Live at `http://51.20.24.243`.
 
 ## The app I inherited
 
@@ -15,29 +17,41 @@ Six containers, defined in [docker-compose.yaml](docker-compose.yaml):
 
 Two databases and a JVM. That combination matters later.
 
-## What I built
+## The infrastructure
 
 ```text
 terraform/
-├── main.tf          # provider, Ubuntu AMI lookup, default VPC, security group, EC2
+├── main.tf          # provider, Ubuntu AMI lookup, default VPC, security group, EC2, EIP
 ├── variables.tf     # region, project name, instance type, key pair, SSH CIDR, repo URL
-├── outputs.tf       # public IP, app URL, SSH command
-├── user_data.sh     # installs git, Docker CE, compose plugin; adds ubuntu to docker group
+├── outputs.tf       # elastic IP, app URL, SSH command
+├── user_data.sh     # installs git, Docker CE, compose plugin, 2 GB swapfile
 └── terraform.tfvars # gitignored
 ```
 
-[main.tf](terraform/main.tf) pulls the latest Ubuntu 24.04 AMI for whatever region you point it at, drops an instance into the default VPC with a 20 GB gp3 root volume, and attaches a security group opening 22 and 80 inbound with everything allowed out. Nothing exotic. It works, and `terraform apply` gets you a running app in about four minutes.
+[main.tf](terraform/main.tf) pulls the latest Ubuntu 24.04 AMI for whatever region you point it at, drops an instance into the default VPC with a 20 GB gp3 root volume, and attaches a security group opening 22 and 80 inbound with everything allowed out. Nothing exotic. `terraform apply` gets you a running box in about fifteen seconds.
 
-The pipeline lives in [.github/workflows/deploy.yml](.github/workflows/deploy.yml). Every push to `main` triggers `appleboy/ssh-action`, which SSHes into the box, clones the repo if it isn't there yet, hard-resets to `origin/main`, then tears down and rebuilds the stack:
+The Elastic IP came later and solved a specific annoyance. An auto-assigned public address changes every time the instance stops or gets replaced, so every resize meant updating the `EC2_HOST` secret and every stale value meant a deploy hanging on SSH until it timed out. An EIP attached to a running instance costs $0.005/hour, which is exactly what the auto-assigned address already cost, so the address became permanent for nothing.
+
+## The pipeline
+
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs two jobs on every push to `main`.
+
+**`build`** fans out across a three-way matrix, so `client`, `nodeapi`, and `javaapi` compile in parallel on GitHub's runners. Each image gets pushed to Docker Hub under two tags: the commit SHA, and `latest`. Layer caching goes through `type=gha`, so a change to `nodeapi` doesn't trigger a Maven rebuild of the Java service.
+
+**`deploy`** declares `needs: build`, then SSHes in, writes the registry namespace and commit SHA into a `.env` file, and runs:
 
 ```bash
-git fetch origin main
-git reset --hard origin/main
-docker compose down || true
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-Three secrets drive it: `EC2_HOST`, `EC2_USER`, and `EC2_SSH_KEY` holding the private key contents. The `.pem` never goes near the repo; [.gitignore](.gitignore) covers `*.pem`, `.env`, tfstate, and `terraform.tfvars`.
+No `--build` anywhere. The server pulls images and starts them; it never compiles anything. The repo still gets cloned there because compose needs the YAML and `nginx/default.conf`, but that's all it's for now.
+
+A `curl -fsS` loop against port 80 closes the job, retrying for five minutes. Before that existed the workflow went green whenever containers started, even if the app was throwing 500s.
+
+Five secrets drive it: `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`. The `.pem` never goes near the repo; [.gitignore](.gitignore) covers `*.pem`, `.env`, tfstate, and `terraform.tfvars`.
+
+A cached run takes just under two minutes end to end.
 
 ## Things that broke
 
@@ -46,6 +60,8 @@ Three secrets drive it: `EC2_HOST`, `EC2_USER`, and `EC2_SSH_KEY` holding the pr
 **No app directory on the instance.** `user_data.sh` installs Docker and Git but never clones anything, so the first pipeline run had nowhere to deploy into. The workflow now creates `~/microservices` and clones if the directory is missing.
 
 **Docker permissions.** Standard fix, `usermod -aG docker ubuntu` in user_data, so the deploy script doesn't need sudo.
+
+**Builds failing on a secret that didn't exist yet.** I pushed the new pipeline before saving the Docker Hub credentials, so all three build jobs died at the login step. The useful part was watching `needs: build` do its job: the deploy was skipped rather than half-applied, and the server never saw a broken release. The failed check stays pinned to that commit even after a later run passes, which looks alarming and means nothing.
 
 ## The cost problem
 
@@ -69,8 +85,6 @@ Around $72 of usage in total, all of it absorbed by free-tier credits, so nothin
 Two costs I didn't know about until I looked:
 
 Every public IPv4 address bills at $0.005/hour whether or not it's doing anything, a change AWS made in February 2024. July's VPC line was $4.54, which is almost entirely that. And stopping an instance doesn't stop the EBS charge — the volume keeps billing while the instance sits there doing nothing.
-
-I've since terminated the emartapp instance. The orphaned security group and a stale tfstate are still sitting there, which is its own small lesson about local state files.
 
 ## What "free tier" actually means here
 
@@ -103,29 +117,25 @@ aws ec2 describe-instance-types \
 
 Which reframes the original mistake. `c7i-flex.large` was never a rule I broke; it's on the allowlist, and that's precisely why nothing stopped me. It's just the most expensive entry on it, and I left it running.
 
-The RAM question still bites, though. The pipeline runs `docker compose up -d --build` on the server, so the box compiles the Angular client and runs a Maven build for the Java API. Maven alone wants more than 1 GiB, and MySQL 8 plus MongoDB plus a JVM won't sit in 1 GiB together with anything left over. Moving builds into GitHub Actions cuts the peak enough that a small instance becomes reasonable; without that change, no amount of instance-shrinking works.
-
 Credits expire on the date whether I spend them or not, which flips the usual instinct. Hoarding them wastes them.
 
-So the rebuild went back to `c7i-flex.large`, not out of preference but because 4 GiB is what the on-server build needs and nothing cheaper on the allowlist offers it. There's a 2 GB swapfile in [user_data.sh](terraform/user_data.sh) now as well, so a Maven build can't OOM-kill the running containers. At $2.18 a day the credits won't survive to 22 August, which makes the ordering of the roadmap below a budget question rather than a tidiness one: move builds into GitHub Actions, drop to `t3.small` at $0.52 a day, and the remaining balance stretches to the deadline with room for a short EKS experiment.
+The box currently runs `c7i-flex.large`, sized back when the pipeline still compiled on the server and 4 GiB was the floor. That constraint is gone now that GitHub does the building, so dropping to `t3.small` is the next change and takes the burn from $2.18 a day to $0.52. There's a 2 GB swapfile in [user_data.sh](terraform/user_data.sh) to absorb whatever spikes remain.
 
 ## Work to be done
 
 Ordered by what I'd tackle first.
 
-**1. Move builds off the server.** Build images in GitHub Actions, push to Docker Hub (free, unlimited public repos, and a better fit here than ECR whose free tier caps at 500 MB), then have EC2 only run `docker compose pull && docker compose up -d`. No compiler ever touches the instance. Deploys drop from minutes to seconds, and rolling back becomes a matter of pointing at the previous tag.
+**1. Budget alarm at $1.** An `aws_budgets_budget` resource in its own file so `terraform destroy` on the app doesn't take the alarm with it. Given I ran a $65/month instance for weeks without noticing, this should honestly have been first, and it's embarrassing that it still isn't done.
 
-**2. Budget alarm at $1.** An `aws_budgets_budget` resource in its own file so `terraform destroy` on the app doesn't take the alarm with it. Given I ran a $62/month instance without noticing, this should honestly have been first.
+**2. Drop to `t3.small`.** Nothing compiles on the server any more, so the 4 GiB is idle capacity. Two databases and a JVM in 2 GiB is tight, maybe 1.5 GiB resident, and the swapfile covers the rest. Reversible in a minute if it thrashes.
 
 **3. Close port 22.** Replace the SSH action with AWS Systems Manager Session Manager, using an instance profile carrying `AmazonSSMManagedInstanceCore` and OIDC auth from Actions instead of a long-lived key. That removes the `0.0.0.0/0` rule and the `EC2_SSH_KEY` secret together.
 
-**4. Remote state.** [terraform.tfstate](terraform/terraform.tfstate) currently lives on my laptop, so losing it means losing the ability to manage or destroy anything it tracks. S3 backend with `use_lockfile` (Terraform 1.10+ handles locking natively now, no DynamoDB table needed). Costs nothing under the S3 free tier.
+**4. Remote state.** [terraform.tfstate](terraform/) currently lives on my laptop, so losing it means losing the ability to manage or destroy anything it tracks. S3 backend with `use_lockfile` (Terraform 1.10+ handles locking natively now, no DynamoDB table needed). Costs nothing under the S3 free tier.
 
-**5. A CI stage before the CD stage.** Right now a broken `nodeapi` reaches production untested. `terraform fmt -check`, `validate`, tfsec, a build, whatever tests exist. The deploy job `needs:` it.
+**5. A CI stage before the CD stage.** A broken `nodeapi` still reaches production untested; the build proves an image compiles, not that it works. `terraform fmt -check`, `validate`, tfsec, and whatever tests exist, with `deploy` depending on all of it.
 
-**6. Health check after deploy.** The workflow currently reports success as long as the containers start, even if the app returns 500s. A `curl -f` retry loop against port 80 as the final step.
-
-Further out, and deliberately not on the free tier: the repo already carries a [kkartchart/](kkartchart/) Helm chart from upstream that nobody's using, so EKS is the obvious next step. EKS charges $0.10/hour for the control plane before a single node exists, which is around $73 a month, so that one waits until it's a deliberate spend rather than a surprise. Same reasoning for an ALB at roughly $16 a month, and for Prometheus and Grafana, which won't fit in 1 GB anyway. TLS is more achievable: Caddy in front with a DuckDNS subdomain gets automatic Let's Encrypt certs for nothing, and kills the awkward "use HTTP, not HTTPS" caveat below.
+Further out, and deliberately not on the free tier: the repo already carries a [kkartchart/](kkartchart/) Helm chart from upstream that nobody's using, so EKS is the obvious next step. EKS charges $0.10/hour for the control plane before a single node exists, which is around $73 a month, so that one waits until it's a deliberate spend rather than a surprise. Same reasoning for an ALB at roughly $16 a month, and for Prometheus and Grafana, which won't fit comfortably alongside everything else. TLS is more achievable: Caddy in front with a DuckDNS subdomain gets automatic Let's Encrypt certs for nothing, and kills the awkward "use HTTP, not HTTPS" caveat below.
 
 ## Running it
 
@@ -154,12 +164,22 @@ terraform plan
 terraform apply
 ```
 
-Add `EC2_HOST`, `EC2_USER` (`ubuntu`), and `EC2_SSH_KEY` under Settings → Secrets and variables → Actions in the GitHub repo. Push to `main` and the workflow takes over.
+Generate a Docker Hub access token with Read & Write permissions, then add five secrets under Settings → Secrets and variables → Actions:
 
-The app comes up at `http://<ec2-public-ip>` on plain HTTP. There's no certificate, so don't type `https://`.
+| Secret | Value |
+| --- | --- |
+| `EC2_HOST` | the Elastic IP from `terraform output` |
+| `EC2_USER` | `ubuntu` |
+| `EC2_SSH_KEY` | contents of your `.pem` |
+| `DOCKERHUB_USERNAME` | your Docker Hub username, also the image namespace |
+| `DOCKERHUB_TOKEN` | the access token |
 
-**Set a billing alarm before you apply this.** I didn't, and while it cost me nothing in the end, that was luck rather than anything I did right.
+Push to `main` and the workflow takes over. The app comes up at `http://<elastic-ip>` on plain HTTP; there's no certificate, so don't type `https://`.
+
+Rolling back means setting `TAG` in `.env` on the instance to an earlier commit SHA and running `docker compose up -d`. Every commit that ever passed CI is still sitting in Docker Hub.
+
+**Set a billing alarm before you apply any of this.** I didn't, and while it cost me nothing in the end, that was luck rather than anything I did right.
 
 ## Stack
 
-Terraform, AWS EC2, security groups, Ubuntu 24.04, Docker, Docker Compose, GitHub Actions, SSH, nginx, Node, Java, MongoDB, MySQL.
+Terraform, AWS EC2, Elastic IP, security groups, Ubuntu 24.04, Docker, Docker Compose, Docker Hub, GitHub Actions, SSH, nginx, Node, Java, MongoDB, MySQL.
