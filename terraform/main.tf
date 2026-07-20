@@ -89,3 +89,16 @@ resource "aws_instance" "emartapp_server" {
     Project = var.project_name
   }
 }
+
+# Without this the public IP changes every time the instance stops or is
+# replaced, which means updating the EC2_HOST secret each time. An EIP attached
+# to a running instance costs the same $0.005/hr as the auto-assigned address.
+resource "aws_eip" "emartapp_server" {
+  instance = aws_instance.emartapp_server.id
+  domain   = "vpc"
+
+  tags = {
+    Name    = "${var.project_name}-eip"
+    Project = var.project_name
+  }
+}
