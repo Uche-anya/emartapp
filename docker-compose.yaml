@@ -1,7 +1,6 @@
-version: "3.8"
-
 services:
   client:
+    image: ${REGISTRY:-emartapp}/emartapp-client:${TAG:-latest}
     build:
       context: ./client
     ports:
@@ -12,6 +11,7 @@ services:
       - webapi
 
   api:
+    image: ${REGISTRY:-emartapp}/emartapp-nodeapi:${TAG:-latest}
     build:
       context: ./nodeapi
     ports:
@@ -23,6 +23,7 @@ services:
       - emongo
 
   webapi:
+    image: ${REGISTRY:-emartapp}/emartapp-javaapi:${TAG:-latest}
     build:
       context: ./javaapi
     ports:

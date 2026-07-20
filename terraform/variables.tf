@@ -11,7 +11,9 @@ variable "project_name" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type"
+  # Must be free-tier-eligible or RunInstances rejects it. Check the list with:
+  #   aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true
+  description = "EC2 instance type (must be free-tier-eligible)"
   type        = string
   default     = "c7i-flex.large"
 }

@@ -31,3 +31,13 @@ usermod -aG docker ubuntu
 
 systemctl enable docker
 systemctl start docker
+
+# Maven and the Angular build spike well past what the compose stack needs at
+# rest. Swap keeps a build from OOM-killing the running containers.
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi

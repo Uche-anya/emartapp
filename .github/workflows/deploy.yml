@@ -1,49 +1,100 @@
-name: Deploy emartapp to EC2
+name: Build and deploy emartapp
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
+  build:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: client
+            context: ./client
+          - service: nodeapi
+            context: ./nodeapi
+          - service: javaapi
+            context: ./javaapi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/emartapp-${{ matrix.service }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/emartapp-${{ matrix.service }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy:
-    name: Deploy Docker Compose App
+    name: Deploy to EC2
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy on EC2 through SSH
+      - name: Pull images and restart the stack
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          REGISTRY: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAG: ${{ github.sha }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: REGISTRY,TAG
           script: |
             set -e
 
-            echo "Creating microservices directory if missing..."
             mkdir -p ~/microservices
             cd ~/microservices
 
-            echo "Checking if emartapp repo exists..."
-            if [ ! -d "emartapp" ]; then
-              echo "Repo not found. Cloning your fork..."
+            if [ ! -d emartapp ]; then
               git clone https://github.com/Uche-anya/emartapp.git
             fi
 
-            cd ~/microservices/emartapp
-
-            echo "Making sure EC2 repo points to your fork..."
+            cd emartapp
             git remote set-url origin https://github.com/Uche-anya/emartapp.git
-
-            echo "Resetting EC2 repo to latest main from your fork..."
             git fetch origin main
             git reset --hard origin/main
 
-            echo "Stopping old containers..."
-            docker compose down || true
+            # The repo is still needed for the compose file and nginx/default.conf,
+            # but nothing gets built here any more. Compose picks up .env on its
+            # own, and .env is gitignored so the reset above never wipes it.
+            printf 'REGISTRY=%s\nTAG=%s\n' "$REGISTRY" "$TAG" > .env
 
-            echo "Rebuilding and starting containers..."
-            docker compose up -d --build
-
-            echo "Checking running containers..."
+            docker compose pull
+            docker compose up -d
             docker compose ps
+
+            # 20 GB root volume fills quickly when every commit is a new tag
+            docker image prune -f
+
+      - name: Wait for the app to answer
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 "http://${{ secrets.EC2_HOST }}" > /dev/null; then
+              echo "up after $((i * 10))s"
+              exit 0
+            fi
+            echo "attempt $i: not ready yet"
+            sleep 10
+          done
+          echo "app never answered on port 80"
+          exit 1
