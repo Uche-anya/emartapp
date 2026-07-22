@@ -141,9 +141,15 @@ The first working version was one server, one SSH key, one local state file, and
 
 **A CI gate.** The `ci` job runs `terraform fmt -check`, `validate`, and tfsec before any image is built, with `build` depending on it. It's an infrastructure gate, not an application one. The honest gap: there are no real app tests to run. `nodeapi`'s test script is the default `exit 1` placeholder and the Angular tests need a browser, so claiming a test stage I don't have would be worse than admitting the hole.
 
-## Still to do
+## The nginx bug the resize exposed
 
-**Fix the nginx cold-start race.** The resize rebooted the box, and nginx crash-looped for about a minute afterwards. Its config has an `upstream client { server client:4200; }` block, and nginx refuses to start if `client` isn't resolvable yet, so on a cold boot it loses the race and exits until the retry catches. A normal deploy doesn't hit this, because the dependencies are already running, only a full reboot does. The fix is to make nginx resolve the upstream at request time rather than startup, or give it a proper `depends_on` health condition.
+Worth writing up, because it's the kind of thing that only shows under change. Resizing rebooted the box, and the deploy right after it went red: the app 502'd and stayed there. nginx was up, but every request came back `connection refused` against an upstream IP that no longer existed.
+
+The cause was in [nginx/default.conf](nginx/default.conf). nginx resolves an upstream hostname once, when its config loads, and caches the IP for the life of the process. Docker hands a container a new IP each time it's recreated, so the moment a deploy replaced the `client` container, nginx was pointing at a dead address and had no reason to look again. The same single-resolution behaviour also meant nginx refused to start at all on a cold boot if `client` wasn't up yet, which is the crash loop I'd seen during the resize. One root cause, two symptoms.
+
+The fix is to defer the lookup to request time. Putting each hostname in a variable and pointing nginx at Docker's embedded DNS (`resolver 127.0.0.11 valid=10s`) makes it re-resolve as it serves, with a short cache. Recreating the `client` container now and hitting the site returns 200 without touching nginx. The deploy also reloads nginx gracefully so a changed config takes effect.
+
+## Still to do
 
 **Delete the unused SSH secrets** from GitHub. `EC2_SSH_KEY` and `EC2_USER` are dead now that the deploy goes over SSM; leaving them is just stale surface area.
 
