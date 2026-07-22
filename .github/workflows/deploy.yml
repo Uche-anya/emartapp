@@ -118,6 +118,13 @@ jobs:
             printf "REGISTRY=%s\nTAG=%s\n" "${REGISTRY}" "${TAG}" > .env
             docker compose pull
             docker compose up -d
+
+            # nginx mounts its config from the repo and caches upstream IPs, so
+            # a graceful reload picks up both a changed config and any container
+            # that got a new IP during up -d. Falls back to a restart if the
+            # container was itself just recreated.
+            docker compose exec -T nginx nginx -s reload 2>/dev/null || docker compose restart nginx
+
             docker image prune -f
           '
           EOF
