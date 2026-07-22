@@ -23,39 +23,47 @@ Two databases and a JVM. That combination matters later.
 terraform/
 ├── main.tf          # provider, Ubuntu AMI lookup, default VPC, security group, EC2, EIP
 ├── variables.tf     # region, project name, instance type, key pair, SSH CIDR, repo URL
-├── outputs.tf       # elastic IP, app URL, SSH command
+├── outputs.tf       # elastic IP, app URL, deploy role ARN
+├── backend.tf       # S3 remote state with native lockfile
+├── budget.tf        # $1 monthly budget alarm, kept separate on purpose
+├── ssm.tf           # IAM instance profile so the box registers with SSM
+├── github_oidc.tf   # OIDC provider + the role Actions assumes to deploy
 ├── user_data.sh     # installs git, Docker CE, compose plugin, 2 GB swapfile
 └── terraform.tfvars # gitignored
 ```
 
 [main.tf](terraform/main.tf) pulls the latest Ubuntu 24.04 AMI for whatever region you point it at, drops an instance into the default VPC with a 20 GB gp3 root volume, and attaches a security group opening 22 and 80 inbound with everything allowed out. Nothing exotic. `terraform apply` gets you a running box in about fifteen seconds.
 
+State lives in S3, not on my laptop. The bucket is versioned and encrypted, and locking is the native `use_lockfile` that Terraform 1.10 added, so there's no DynamoDB table to run alongside it. The bucket gets created out of band rather than by this Terraform, because a config can't store its own state in a bucket it hasn't created yet, and putting the bucket under management would mean `destroy` trying to delete the thing it's reading state from. The bootstrap commands are in [backend.tf](terraform/backend.tf).
+
 The Elastic IP came later and solved a specific annoyance. An auto-assigned public address changes every time the instance stops or gets replaced, so every resize meant updating the `EC2_HOST` secret and every stale value meant a deploy hanging on SSH until it timed out. An EIP attached to a running instance costs $0.005/hour, which is exactly what the auto-assigned address already cost, so the address became permanent for nothing.
 
 ## The pipeline
 
-[.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs two jobs on every push to `main`.
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs three jobs on every push to `main`.
 
-**`build`** fans out across a three-way matrix, so `client`, `nodeapi`, and `javaapi` compile in parallel on GitHub's runners. Each image gets pushed to Docker Hub under two tags: the commit SHA, and `latest`. Layer caching goes through `type=gha`, so a change to `nodeapi` doesn't trigger a Maven rebuild of the Java service.
+**`ci`** validates the Terraform before anything gets built: `fmt -check`, then `validate` against a backend-less init so it needs no AWS credentials, then tfsec. tfsec runs soft-fail on purpose, so it reports the open SSH port as a finding rather than blocking on a compromise that's already documented and on its way out.
 
-**`deploy`** declares `needs: build`, then SSHes in, writes the registry namespace and commit SHA into a `.env` file, and runs:
+**`build`** declares `needs: ci` and fans out across a three-way matrix, so `client`, `nodeapi`, and `javaapi` compile in parallel on GitHub's runners. Each image gets pushed to Docker Hub under two tags: the commit SHA, and `latest`. Layer caching goes through `type=gha`, so a change to `nodeapi` doesn't trigger a Maven rebuild of the Java service.
+
+**`deploy`** declares `needs: build`. It used to SSH in with `appleboy/ssh-action` and a long-lived private key; it now assumes an AWS role through OIDC and drives the box over Systems Manager instead. It finds the instance by tag, sends one `AWS-RunShellScript` command, and polls the invocation for the result:
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-No `--build` anywhere. The server pulls images and starts them; it never compiles anything. The repo still gets cloned there because compose needs the YAML and `nginx/default.conf`, but that's all it's for now.
+No `--build` anywhere, and no inbound SSH. The command runs under SSM as root and hands the actual work to the `ubuntu` user, which owns the checkout and sits in the docker group, so file and container ownership stay consistent with every earlier deploy. The repo still gets cloned there because compose needs the YAML and `nginx/default.conf`, but that's all it's for now.
 
 A `curl -fsS` loop against port 80 closes the job, retrying for five minutes. Before that existed the workflow went green whenever containers started, even if the app was throwing 500s.
 
-Five secrets drive it: `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`. The `.pem` never goes near the repo; [.gitignore](.gitignore) covers `*.pem`, `.env`, tfstate, and `terraform.tfvars`.
+Six secrets drive it now: `EC2_HOST` and `AWS_DEPLOY_ROLE`, plus `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for the registry. `EC2_USER` and `EC2_SSH_KEY` are still present but no longer used by the pipeline; they go once the SSM path has a few green runs behind it. Nothing sensitive lands in the repo: [.gitignore](.gitignore) covers `*.pem`, `.env`, tfstate, and `terraform.tfvars`.
 
 A cached run takes just under two minutes end to end.
 
 ## Things that broke
 
-**SSH timed out from Actions.** The security group originally allowed port 22 from my home IP only, which was fine from my laptop and useless from GitHub's runners, since those come from a wide and shifting pool of GitHub-hosted addresses. The error was just `dial tcp <ip>:22: i/o timeout`, which took me a while to connect back to the CIDR rule. I opened 22 to `0.0.0.0/0` to get moving. That's the wrong fix and I've left it visible in the code rather than quietly patching it, because the right fix is in the roadmap below.
+**SSH timed out from Actions.** The security group originally allowed port 22 from my home IP only, which was fine from my laptop and useless from GitHub's runners, since those come from a wide and shifting pool of GitHub-hosted addresses. The error was just `dial tcp <ip>:22: i/o timeout`, which took me a while to connect back to the CIDR rule. I opened 22 to `0.0.0.0/0` to get moving, which is the wrong fix and I left it visible in the code rather than quietly patching it. The proper fix is now built and described below: the pipeline drives the box over Systems Manager, so once that path has proven itself the port closes and the timeout can't recur, because there's no inbound SSH to time out on.
 
 **No app directory on the instance.** `user_data.sh` installs Docker and Git but never clones anything, so the first pipeline run had nowhere to deploy into. The workflow now creates `~/microservices` and clones if the directory is missing.
 
@@ -119,21 +127,23 @@ Which reframes the original mistake. `c7i-flex.large` was never a rule I broke; 
 
 Credits expire on the date whether I spend them or not, which flips the usual instinct. Hoarding them wastes them.
 
-The box currently runs `c7i-flex.large`, sized back when the pipeline still compiled on the server and 4 GiB was the floor. That constraint is gone now that GitHub does the building, so dropping to `t3.small` is the next change and takes the burn from $2.18 a day to $0.52. There's a 2 GB swapfile in [user_data.sh](terraform/user_data.sh) to absorb whatever spikes remain.
+The box currently runs `c7i-flex.large`, sized back when the pipeline still compiled on the server and 4 GiB was the floor. That constraint is gone now that GitHub does the building, so dropping to `t3.small` takes the burn from $2.18 a day to $0.52. That resize is the one change I'm holding until the SSM deploy has a green run, since I'd rather not change two things at once and then guess which one broke. There's a 2 GB swapfile in [user_data.sh](terraform/user_data.sh) to absorb whatever spikes remain.
 
-## Work to be done
+## What I hardened afterwards
 
-Ordered by what I'd tackle first.
+The first working version was one server, one SSH key, one local state file, and no idea what it cost. Everything here was walking that back.
 
-**1. Budget alarm at $1.** An `aws_budgets_budget` resource in its own file so `terraform destroy` on the app doesn't take the alarm with it. Given I ran a $65/month instance for weeks without noticing, this should honestly have been first, and it's embarrassing that it still isn't done.
+**Budget alarm.** [budget.tf](terraform/budget.tf) is a $1 monthly budget with both an actual and a forecasted alert, kept in its own file so `terraform destroy` on the app can't take the thing that warns me about spending down with it. The forecasted alert is the one that earns its keep: it fires days before the money actually lands, off the account's own projection. This should have been the first thing I built rather than the fourth.
 
-**2. Drop to `t3.small`.** Nothing compiles on the server any more, so the 4 GiB is idle capacity. Two databases and a JVM in 2 GiB is tight, maybe 1.5 GiB resident, and the swapfile covers the rest. Reversible in a minute if it thrashes.
+**Remote state.** The state file moved off my laptop into a versioned, encrypted S3 bucket with native locking. Losing a local state file means Terraform no longer knows what it owns and can't cleanly update or destroy any of it; versioning turns a corrupted state from unrecoverable into an annoyance.
 
-**3. Close port 22.** Replace the SSH action with AWS Systems Manager Session Manager, using an instance profile carrying `AmazonSSMManagedInstanceCore` and OIDC auth from Actions instead of a long-lived key. That removes the `0.0.0.0/0` rule and the `EC2_SSH_KEY` secret together.
+**SSM instead of SSH.** [ssm.tf](terraform/ssm.tf) gives the instance an IAM profile carrying `AmazonSSMManagedInstanceCore`, so its agent registers with Systems Manager and the deploy runs through the AWS API. [github_oidc.tf](terraform/github_oidc.tf) is the other half: Actions assumes a role by proving which repo and branch it's running from, so there's no static AWS key anywhere. The role's condition pins it to `main` of this one repo, and its permissions are two lines: send one `AWS-RunShellScript` command to this one instance, and read the result. Once a deploy over that path goes green, port 22 closes and `EC2_SSH_KEY` gets deleted.
 
-**4. Remote state.** [terraform.tfstate](terraform/) currently lives on my laptop, so losing it means losing the ability to manage or destroy anything it tracks. S3 backend with `use_lockfile` (Terraform 1.10+ handles locking natively now, no DynamoDB table needed). Costs nothing under the S3 free tier.
+**A CI gate.** The `ci` job runs `terraform fmt -check`, `validate`, and tfsec before any image is built, with `build` depending on it. It's an infrastructure gate, not an application one. The honest gap: there are no real app tests to run. `nodeapi`'s test script is the default `exit 1` placeholder and the Angular tests need a browser, so claiming a test stage I don't have would be worse than admitting the hole.
 
-**5. A CI stage before the CD stage.** A broken `nodeapi` still reaches production untested; the build proves an image compiles, not that it works. `terraform fmt -check`, `validate`, tfsec, and whatever tests exist, with `deploy` depending on all of it.
+## Still to do
+
+**Close port 22 and resize**, together, right after the first green SSM deploy. Same apply flips the ingress rule to drop 22 and changes the instance type to `t3.small`.
 
 Further out, and deliberately not on the free tier: the repo already carries a [kkartchart/](kkartchart/) Helm chart from upstream that nobody's using, so EKS is the obvious next step. EKS charges $0.10/hour for the control plane before a single node exists, which is around $73 a month, so that one waits until it's a deliberate spend rather than a surprise. Same reasoning for an ALB at roughly $16 a month, and for Prometheus and Grafana, which won't fit comfortably alongside everything else. TLS is more achievable: Caddy in front with a DuckDNS subdomain gets automatic Let's Encrypt certs for nothing, and kills the awkward "use HTTP, not HTTPS" caveat below.
 
@@ -164,17 +174,18 @@ terraform plan
 terraform apply
 ```
 
-Generate a Docker Hub access token with Read & Write permissions, then add five secrets under Settings → Secrets and variables → Actions:
+Generate a Docker Hub access token with Read & Write permissions, then add these secrets under Settings → Secrets and variables → Actions:
 
 | Secret | Value |
 | --- | --- |
 | `EC2_HOST` | the Elastic IP from `terraform output` |
-| `EC2_USER` | `ubuntu` |
-| `EC2_SSH_KEY` | contents of your `.pem` |
+| `AWS_DEPLOY_ROLE` | the `github_deploy_role_arn` output |
 | `DOCKERHUB_USERNAME` | your Docker Hub username, also the image namespace |
 | `DOCKERHUB_TOKEN` | the access token |
 
 Push to `main` and the workflow takes over. The app comes up at `http://<elastic-ip>` on plain HTTP; there's no certificate, so don't type `https://`.
+
+The deploy authenticates through OIDC, so there's no AWS key to store. If you're bringing this up from scratch on a fresh account, the state bucket has to exist before the first `terraform init`; the two `aws s3api` commands for that are at the top of [backend.tf](terraform/backend.tf).
 
 Rolling back means setting `TAG` in `.env` on the instance to an earlier commit SHA and running `docker compose up -d`. Every commit that ever passed CI is still sitting in Docker Hub.
 
@@ -182,4 +193,4 @@ Rolling back means setting `TAG` in `.env` on the instance to an earlier commit 
 
 ## Stack
 
-Terraform, AWS EC2, Elastic IP, security groups, Ubuntu 24.04, Docker, Docker Compose, Docker Hub, GitHub Actions, SSH, nginx, Node, Java, MongoDB, MySQL.
+Terraform, AWS EC2, Elastic IP, security groups, IAM, Systems Manager, OIDC, S3 remote state, AWS Budgets, Ubuntu 24.04, Docker, Docker Compose, Docker Hub, GitHub Actions, tfsec, nginx, Node, Java, MongoDB, MySQL.
