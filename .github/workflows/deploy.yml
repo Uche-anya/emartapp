@@ -6,9 +6,42 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write # required for OIDC into AWS
+
+env:
+  AWS_REGION: eu-north-1
+
 jobs:
+  ci:
+    name: Validate infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: terraform fmt
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: terraform validate
+        # -backend=false so validation needs no AWS credentials or S3 access
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform
+          # Reports findings without failing the run. The open SSH port is a
+          # known, documented compromise, not a surprise to gate on.
+          soft_fail: true
+
   build:
     name: Build ${{ matrix.service }}
+    needs: ci
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,47 +77,83 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy to EC2
+    name: Deploy over SSM
     needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Pull images and restart the stack
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Assume the deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find the instance
+        id: ec2
+        run: |
+          id=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=emartapp-server" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "instance: $id"
+
+      - name: Send the deploy command
+        id: send
         env:
           REGISTRY: ${{ secrets.DOCKERHUB_USERNAME }}
           TAG: ${{ github.sha }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          envs: REGISTRY,TAG
-          script: |
+        run: |
+          # Runs as root under SSM, so hand the work to ubuntu: it owns the repo
+          # checkout and is in the docker group, which keeps file ownership and
+          # container ownership consistent with every previous deploy.
+          script=$(cat <<EOF
+          runuser -l ubuntu -c '
             set -e
-
-            mkdir -p ~/microservices
-            cd ~/microservices
-
-            if [ ! -d emartapp ]; then
-              git clone https://github.com/Uche-anya/emartapp.git
-            fi
-
-            cd emartapp
-            git remote set-url origin https://github.com/Uche-anya/emartapp.git
+            mkdir -p ~/microservices && cd ~/microservices
+            [ -d emartapp ] || git clone https://github.com/${{ github.repository }}.git
+            cd ~/microservices/emartapp
             git fetch origin main
-            git reset --hard origin/main
-
-            # The repo is still needed for the compose file and nginx/default.conf,
-            # but nothing gets built here any more. Compose picks up .env on its
-            # own, and .env is gitignored so the reset above never wipes it.
-            printf 'REGISTRY=%s\nTAG=%s\n' "$REGISTRY" "$TAG" > .env
-
+            git reset --hard ${TAG}
+            printf "REGISTRY=%s\nTAG=%s\n" "${REGISTRY}" "${TAG}" > .env
             docker compose pull
             docker compose up -d
-            docker compose ps
-
-            # 20 GB root volume fills quickly when every commit is a new tag
             docker image prune -f
+          '
+          EOF
+          )
+          jq -n --arg s "$script" '{commands: [$s]}' > params.json
+          cmd=$(aws ssm send-command \
+            --instance-ids ${{ steps.ec2.outputs.id }} \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${TAG}" \
+            --parameters file://params.json \
+            --query 'Command.CommandId' --output text)
+          echo "cmd=$cmd" >> "$GITHUB_OUTPUT"
+          echo "command: $cmd"
+
+      - name: Wait for the command to finish
+        run: |
+          cmd=${{ steps.send.outputs.cmd }}
+          id=${{ steps.ec2.outputs.id }}
+          for i in $(seq 1 40); do
+            status=$(aws ssm get-command-invocation \
+              --command-id "$cmd" --instance-id "$id" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            echo "attempt $i: $status"
+            case "$status" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut)
+                echo "----- stderr -----"
+                aws ssm get-command-invocation --command-id "$cmd" --instance-id "$id" \
+                  --query 'StandardErrorContent' --output text
+                exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "----- stdout -----"
+          aws ssm get-command-invocation --command-id "$cmd" --instance-id "$id" \
+            --query 'StandardOutputContent' --output text
 
       - name: Wait for the app to answer
         run: |

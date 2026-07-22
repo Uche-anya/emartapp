@@ -74,6 +74,7 @@ resource "aws_instance" "emartapp_server" {
   instance_type          = var.instance_type
   key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.emartapp_sg.id]
+  iam_instance_profile   = aws_iam_instance_profile.ssm.name
 
   user_data = templatefile("${path.module}/user_data.sh", {
     app_repo_url = var.app_repo_url
