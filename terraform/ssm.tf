@@ -1,7 +1,3 @@
-# Lets the instance register itself with Systems Manager, so commands can be
-# delivered through the AWS API instead of an inbound SSH port. The agent dials
-# out to SSM; nothing dials in.
-
 data "aws_iam_policy_document" "ec2_assume" {
   statement {
     actions = ["sts:AssumeRole"]

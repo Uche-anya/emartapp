@@ -32,7 +32,7 @@ terraform/
 └── terraform.tfvars # gitignored
 ```
 
-[main.tf](terraform/main.tf) pulls the latest Ubuntu 24.04 AMI for whatever region you point it at, drops an instance into the default VPC with a 20 GB gp3 root volume, and attaches a security group opening 22 and 80 inbound with everything allowed out. Nothing exotic. `terraform apply` gets you a running box in about fifteen seconds.
+[main.tf](terraform/main.tf) pulls the latest Ubuntu 24.04 AMI for whatever region you point it at, drops an instance into the default VPC with a 20 GB gp3 root volume, and attaches a security group. That group now opens port 80 only; SSH is gone entirely, since the deploy runs over Systems Manager and a shell is a `aws ssm start-session` away. Nothing exotic. `terraform apply` gets you a running box in about fifteen seconds.
 
 State lives in S3, not on my laptop. The bucket is versioned and encrypted, and locking is the native `use_lockfile` that Terraform 1.10 added, so there's no DynamoDB table to run alongside it. The bucket gets created out of band rather than by this Terraform, because a config can't store its own state in a bucket it hasn't created yet, and putting the bucket under management would mean `destroy` trying to delete the thing it's reading state from. The bootstrap commands are in [backend.tf](terraform/backend.tf).
 
@@ -63,7 +63,7 @@ A cached run takes just under two minutes end to end.
 
 ## Things that broke
 
-**SSH timed out from Actions.** The security group originally allowed port 22 from my home IP only, which was fine from my laptop and useless from GitHub's runners, since those come from a wide and shifting pool of GitHub-hosted addresses. The error was just `dial tcp <ip>:22: i/o timeout`, which took me a while to connect back to the CIDR rule. I opened 22 to `0.0.0.0/0` to get moving, which is the wrong fix and I left it visible in the code rather than quietly patching it. The proper fix is now built and described below: the pipeline drives the box over Systems Manager, so once that path has proven itself the port closes and the timeout can't recur, because there's no inbound SSH to time out on.
+**SSH timed out from Actions.** The security group originally allowed port 22 from my home IP only, which was fine from my laptop and useless from GitHub's runners, since those come from a wide and shifting pool of GitHub-hosted addresses. The error was just `dial tcp <ip>:22: i/o timeout`, which took me a while to connect back to the CIDR rule. I opened 22 to `0.0.0.0/0` to get moving, which is the wrong fix, and I left it visible in the code rather than quietly patching it. It's since been fixed properly, described below: the pipeline drives the box over Systems Manager, so the port is closed now and the timeout can't recur, because there's no inbound SSH to time out on.
 
 **No app directory on the instance.** `user_data.sh` installs Docker and Git but never clones anything, so the first pipeline run had nowhere to deploy into. The workflow now creates `~/microservices` and clones if the directory is missing.
 
@@ -127,7 +127,7 @@ Which reframes the original mistake. `c7i-flex.large` was never a rule I broke; 
 
 Credits expire on the date whether I spend them or not, which flips the usual instinct. Hoarding them wastes them.
 
-The box currently runs `c7i-flex.large`, sized back when the pipeline still compiled on the server and 4 GiB was the floor. That constraint is gone now that GitHub does the building, so dropping to `t3.small` takes the burn from $2.18 a day to $0.52. That resize is the one change I'm holding until the SSM deploy has a green run, since I'd rather not change two things at once and then guess which one broke. There's a 2 GB swapfile in [user_data.sh](terraform/user_data.sh) to absorb whatever spikes remain.
+The box ran `c7i-flex.large` for a while, sized back when the pipeline still compiled on the server and 4 GiB was the floor. That constraint went away once GitHub took over the building, so it's now `t3.small` at $0.52 a day instead of $2.18. At rest the stack sits around 1.15 GiB against the 2 GiB the instance has, with the 2 GB swapfile in [user_data.sh](terraform/user_data.sh) barely touched, so there's real headroom. The resize went in the same apply that closed port 22, after the SSM deploy had a green run to prove the pipeline still worked.
 
 ## What I hardened afterwards
 
@@ -137,13 +137,15 @@ The first working version was one server, one SSH key, one local state file, and
 
 **Remote state.** The state file moved off my laptop into a versioned, encrypted S3 bucket with native locking. Losing a local state file means Terraform no longer knows what it owns and can't cleanly update or destroy any of it; versioning turns a corrupted state from unrecoverable into an annoyance.
 
-**SSM instead of SSH.** [ssm.tf](terraform/ssm.tf) gives the instance an IAM profile carrying `AmazonSSMManagedInstanceCore`, so its agent registers with Systems Manager and the deploy runs through the AWS API. [github_oidc.tf](terraform/github_oidc.tf) is the other half: Actions assumes a role by proving which repo and branch it's running from, so there's no static AWS key anywhere. The role's condition pins it to `main` of this one repo, and its permissions are two lines: send one `AWS-RunShellScript` command to this one instance, and read the result. Once a deploy over that path goes green, port 22 closes and `EC2_SSH_KEY` gets deleted.
+**SSM instead of SSH.** [ssm.tf](terraform/ssm.tf) gives the instance an IAM profile carrying `AmazonSSMManagedInstanceCore`, so its agent registers with Systems Manager and the deploy runs through the AWS API. [github_oidc.tf](terraform/github_oidc.tf) is the other half: Actions assumes a role by proving which repo and branch it's running from, so there's no static AWS key anywhere. The role's condition pins it to `main` of this one repo, and its permissions are two lines: send one `AWS-RunShellScript` command to this one instance, and read the result. A deploy over that path went green, so port 22 is now closed at the security group and the SSH ingress rule is deleted from the code. The `EC2_SSH_KEY` and `EC2_USER` secrets can go from GitHub whenever; nothing reads them.
 
 **A CI gate.** The `ci` job runs `terraform fmt -check`, `validate`, and tfsec before any image is built, with `build` depending on it. It's an infrastructure gate, not an application one. The honest gap: there are no real app tests to run. `nodeapi`'s test script is the default `exit 1` placeholder and the Angular tests need a browser, so claiming a test stage I don't have would be worse than admitting the hole.
 
 ## Still to do
 
-**Close port 22 and resize**, together, right after the first green SSM deploy. Same apply flips the ingress rule to drop 22 and changes the instance type to `t3.small`.
+**Fix the nginx cold-start race.** The resize rebooted the box, and nginx crash-looped for about a minute afterwards. Its config has an `upstream client { server client:4200; }` block, and nginx refuses to start if `client` isn't resolvable yet, so on a cold boot it loses the race and exits until the retry catches. A normal deploy doesn't hit this, because the dependencies are already running, only a full reboot does. The fix is to make nginx resolve the upstream at request time rather than startup, or give it a proper `depends_on` health condition.
+
+**Delete the unused SSH secrets** from GitHub. `EC2_SSH_KEY` and `EC2_USER` are dead now that the deploy goes over SSM; leaving them is just stale surface area.
 
 Further out, and deliberately not on the free tier: the repo already carries a [kkartchart/](kkartchart/) Helm chart from upstream that nobody's using, so EKS is the obvious next step. EKS charges $0.10/hour for the control plane before a single node exists, which is around $73 a month, so that one waits until it's a deliberate spend rather than a surprise. Same reasoning for an ALB at roughly $16 a month, and for Prometheus and Grafana, which won't fit comfortably alongside everything else. TLS is more achievable: Caddy in front with a DuckDNS subdomain gets automatic Let's Encrypt certs for nothing, and kills the awkward "use HTTP, not HTTPS" caveat below.
 
@@ -159,7 +161,7 @@ Create `terraform.tfvars` locally (it's gitignored):
 ```hcl
 aws_region       = "eu-north-1"
 project_name     = "emartapp"
-instance_type    = "c7i-flex.large"    # must be free-tier-eligible, see above
+instance_type    = "t3.small"          # must be free-tier-eligible, see above
 key_name         = "your-key-pair-name"
 ssh_allowed_cidr = "your.ip.here/32"
 app_repo_url     = "https://github.com/Uche-anya/emartapp.git"

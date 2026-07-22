@@ -39,13 +39,10 @@ resource "aws_security_group" "emartapp_sg" {
   description = "Security group for ${var.project_name} EC2 instance"
   vpc_id      = data.aws_vpc.default.id
 
-  ingress {
-    description = "Allow SSH from anywhere for GitHub Actions"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # No SSH ingress on purpose. The pipeline deploys over SSM and a shell is a
+  # `aws ssm start-session` away, so nothing needs port 22 open. The
+  # ssh_allowed_cidr variable is kept declared but unused for break-glass: drop
+  # a temporary rule back in here if SSM is ever unreachable.
 
   ingress {
     description = "Allow HTTP from the internet"
